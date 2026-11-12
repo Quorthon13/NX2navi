@@ -66,9 +66,10 @@ static const SDL_GamepadButton pad_sdl[PAD_COUNT] = {
 // and its hold are milliseconds of the world clock (frame_step_world_us, game time since the loaded save's first
 // frame), so it lands at the same game time at any frame rate and load length. A timed event shorter than a frame is
 // applied once. In a script with timed lines (a recording) the untimed ones belong before the world clock: they stop
-// when it starts, as the load ends at another tick in each run.
+// when it starts, as the load ends at another tick in each run. "<frame> MARK <name>" presses nothing: with
+// NX2NAVI_TRACE=perf it ends the running segment of frame times and starts one called <name> (perf.c perf_segment).
 // at, hold: ticks, or microseconds of the world clock when timed.
-typedef struct { uint64_t at, hold; int bit, stick, timed; int32_t x, y; int logged; char text[48]; } ScriptEv;
+typedef struct { uint64_t at, hold; int bit, stick, timed, mark; int32_t x, y; int logged; char text[48]; } ScriptEv;
 static const struct { const char *name; int bit; } script_buttons[] = {
     {"A", B_A}, {"B", B_B}, {"X", B_X}, {"Y", B_Y}, {"LCLICK", B_STICK_L}, {"RCLICK", B_STICK_R}, {"L", B_L}, {"R", B_R},
     {"ZL", B_ZL}, {"ZR", B_ZR}, {"PLUS", B_PLUS}, {"MINUS", B_MINUS}, {"LEFT", B_LEFT}, {"UP", B_UP}, {"RIGHT", B_RIGHT}, {"DOWN", B_DOWN},
@@ -99,7 +100,14 @@ static void script_load(void) {
         ScriptEv e = {.at = (uint64_t)(at * unit + 0.5), .hold = timed ? 66667 : 4, .bit = -1, .timed = timed};
         long a, b;
         double c;
-        if (!strcmp(name, "MOUSE") || !strcmp(name, "LSTICK") || !strcmp(name, "RSTICK")) {
+        if (!strcmp(name, "MARK")) {
+            const char *s = line + off;
+            while (*s == ' ' || *s == '\t') s++;
+            size_t len = strcspn(s, "\r\n");
+            while (len && (s[len - 1] == ' ' || s[len - 1] == '\t')) len--;
+            e.mark = 1, e.hold = 1;
+            snprintf(e.text, sizeof e.text, "%.*s", (int)len, s);
+        } else if (!strcmp(name, "MOUSE") || !strcmp(name, "LSTICK") || !strcmp(name, "RSTICK")) {
             int n = sscanf(line + off, "%ld %ld %lf", &a, &b, &c);
             if (n < 2) { rt_log("input: script line %d: %s needs x y [hold]", ln, name); continue; }
             e.stick = name[0] == 'M' ? 3 : name[0] == 'L' ? 1 : 2; e.x = (int32_t)a; e.y = (int32_t)b;
@@ -135,13 +143,14 @@ static void script_apply(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
         if (e->timed ? w < 0 : script_mixed && w >= 0) continue;
         uint64_t now = e->timed ? (uint64_t)w : tick;
         if (now < e->at || (now >= e->at + e->hold && (e->logged || !e->timed))) continue;
-        if (e->stick == 3 && e->logged) continue;
+        if ((e->stick == 3 || e->mark) && e->logged) continue;
         if (!e->logged) {
             e->logged = 1;
             if (e->timed) rt_log("input: script frame %llu at %.1f ms: %s", (unsigned long long)fr, w / 1000.0, e->text);
             else rt_log("input: script frame %llu tick %llu: %s", (unsigned long long)fr, (unsigned long long)tick, e->text);
         }
-        if (e->stick == 3) {
+        if (e->mark) perf_segment(e->text);
+        else if (e->stick == 3) {
             int64_t x = (int64_t)script_mouse[0] + e->x, y = (int64_t)script_mouse[1] + e->y;
             script_mouse[0] = (int32_t)(x < INT32_MIN ? INT32_MIN : x > INT32_MAX ? INT32_MAX : x);
             script_mouse[1] = (int32_t)(y < INT32_MIN ? INT32_MIN : y > INT32_MAX ? INT32_MAX : y);
@@ -368,17 +377,15 @@ static void mouse_camera(int32_t out[2], int selector) {
         if (fr != frame) {
             double dt = age < 0.004 ? 0.004 : age > 0.1 ? 0.1 : age;
             ikb_mouse_take(&dx, &dy);
-            input_mouse_stick(dx, dy, dt, mouse_sens_get(), held);
+            input_mouse_stick(dx, dy, dt, mouse_sens_get(), cam_speed_applied(), held);
             frame = fr;
             t0 = now;
         } else if (age > 0.1) {
             held[0] = held[1] = 0;   // frames stopped: do not hold a deflection
         }
     }
-    double k = cam_speed_applied(), x = held[0] / k, y = held[1] / k, len = sqrt(x * x + y * y);
-    if (len > STICK_MAX) x *= STICK_MAX / len, y *= STICK_MAX / len;
-    out[0] = (int32_t)lround(x);
-    out[1] = (int32_t)lround(y);
+    out[0] = held[0];
+    out[1] = held[1];
 }
 
 static float stick_dead[2] = {-1, -1};     // input_pad_deadzone of the left and right stick; live (cfg_version)
@@ -491,16 +498,13 @@ static int sdl_enter(void) {
 
 static void sdl_leave(void) { plat_mutex_unlock(&sdl_lock); }
 
-static void stick(SDL_GamepadAxis ax, SDL_GamepadAxis ay, float dead, int32_t out[2]) {
-    input_pad_stick(SDL_GetGamepadAxis(pad, ax), -(int32_t)SDL_GetGamepadAxis(pad, ay), dead, out);
-}
-
 // Every connected gamepad is kept open; `pad` is the one the game reads (and the one that rumbles and feeds motion):
 // the first one found, then whichever one the player presses (pad_follow). Taking only the first gamepad SDL lists
 // left the game deaf when that one was a device nobody holds: a virtual pad of Steam Input or DS4Windows, a wheel, a
 // receiver's idle second slot, listed before the controller in the player's hands.
 enum { MAX_PADS = 8 };
 static SDL_Gamepad *pads[MAX_PADS];
+static uint8_t pad_rest[MAX_PADS];   // per open gamepad, bit a: axis a has been seen at rest (pad_axis)
 static int npads;
 static int pad_pressed_logged;       // the primary's first press was logged (once per primary)
 
@@ -529,9 +533,58 @@ static void pad_primary(SDL_Gamepad *p, const char *why) {
            pad_east_a ? "labelled A" : "not labelled A");
 }
 
+// Joysticks SDL has no gamepad mapping for are not gamepads to it, and this file opens gamepads only. Known ones get a
+// mapping built from their own GUID (so it matches whatever bus, version and name checksum SDL put in it); any other is
+// logged once with its name, ids and GUID.
+// - A Switch that presents its Joy-Con over USB from its boot menu's tools:
+//   "Nyx Joy-Con", VID 0x11EC, PID 0xA7E1, a plain HID joystick: X, Y (left stick), Z, Rz (right stick) from 0 to 255
+//   with up at 0, a hat for the D-pad, and buttons 1-12 B, A, Y, X (south, east, west, north), L, R, ZL, ZR, Minus,
+//   Plus, left and right stick clicks. Capture and Home are not sent.
+static const struct { uint16_t vid, pid; const char *name, *map; } known_joysticks[] = {
+    {0x11EC, 0xA7E1, "Nyx Joy-Con (USB HID)",
+     "a:b0,b:b1,x:b2,y:b3,leftshoulder:b4,rightshoulder:b5,lefttrigger:b6,righttrigger:b7,back:b8,start:b9,leftstick:b10,"
+     "rightstick:b11,dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,leftx:a0,lefty:a1,rightx:a2,righty:a3"},
+};
+
+static void map_joysticks(void) {
+    static SDL_JoystickID seen[32];
+    static int nseen;
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetJoysticks(&n);
+    for (int i = 0; ids && i < n; i++) {
+        int done = 0;
+        for (int k = 0; k < nseen && !done; k++) done = seen[k] == ids[i];
+        if (done || SDL_IsGamepad(ids[i])) continue;
+        if (nseen < (int)(sizeof seen / sizeof *seen)) seen[nseen++] = ids[i];
+        uint16_t vid = SDL_GetJoystickVendorForID(ids[i]), pid = SDL_GetJoystickProductForID(ids[i]);
+        char guid[64];
+        SDL_GUIDToString(SDL_GetJoystickGUIDForID(ids[i]), guid, (int)sizeof guid);
+        const char *jname = SDL_GetJoystickNameForID(ids[i]);
+        int mapped = 0;
+        for (size_t k = 0; k < sizeof known_joysticks / sizeof *known_joysticks; k++) {
+            if (known_joysticks[k].vid != vid || known_joysticks[k].pid != pid) continue;
+            char m[512];
+            snprintf(m, sizeof m, "%s,%s,%s", guid, known_joysticks[k].name, known_joysticks[k].map);
+            int r = SDL_AddGamepadMapping(m);
+            rt_log("input: joystick \"%s\" (%04x:%04x, GUID %s) mapped as a gamepad (%s)%s%s", jname ? jname : "?", vid, pid,
+                   guid, known_joysticks[k].name, r < 0 ? ": mapping refused, " : "", r < 0 ? SDL_GetError() : "");
+            mapped = 1;
+        }
+        if (!mapped)
+            rt_log("input: joystick \"%s\" (%04x:%04x, GUID %s) has no gamepad mapping in SDL: not used (an SDL mapping "
+                   "in the SDL_GAMECONTROLLERCONFIG environment variable adds one)", jname ? jname : "?", vid, pid, guid);
+    }
+    SDL_free(ids);
+}
+
 // Under lock: closes the gamepads that went away and opens the ones that came; the primary falls back to the first
 // open one when it left. Logs each change.
+// The game is always told one controller is connected, so a disconnect read as nothing pressed and play went on
+// uncontrolled (the console would stop and ask for a controller). When the primary goes and no other gamepad takes
+// its place, the menu opens: the player sees it, and it takes the keyboard and mouse until it is closed.
 static void scan_pads(void) {
+    int had = pad != NULL;
+    map_joysticks();
     for (int i = 0; i < npads;) {
         if (SDL_GamepadConnected(pads[i])) { i++; continue; }
         rt_log("input: gamepad \"%s\" disconnected", SDL_GetGamepadName(pads[i]) ? SDL_GetGamepadName(pads[i]) : "?");
@@ -541,7 +594,8 @@ static void scan_pads(void) {
             for (int k = 0; k < 4; k++) plat_xchg32(&pad_labels[k], PAD_LABEL_NONE);
         }
         SDL_CloseGamepad(pads[i]);
-        pads[i] = pads[--npads];
+        --npads;
+        pads[i] = pads[npads], pad_rest[i] = pad_rest[npads];
     }
     int n = 0;
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
@@ -551,19 +605,47 @@ static void scan_pads(void) {
         if (open) continue;
         SDL_Gamepad *p = SDL_OpenGamepad(ids[i]);
         if (!p) { rt_log("input: gamepad %u could not be opened (%s)", (unsigned)ids[i], SDL_GetError()); continue; }
+        pad_rest[npads] = 0;
         pads[npads++] = p;
         if (pad) rt_log("input: gamepad \"%s\" connected (the game switches to it at its first press)", SDL_GetGamepadName(p));
     }
     SDL_free(ids);
     if (!pad && npads) pad_primary(pads[0], "in use");
+    if (had && !pad && !menu_is_open()) {
+        rt_log("input: the gamepad in use went away and no other is connected: the menu opens");
+        menu_toggle();
+    }
 }
 
-// Under lock: 1 when p has a button down, a trigger pulled or a stick past half way (a drifting stick does not count).
+// Under lock: axis a of open gamepad p, or 0 until the axis has been seen at rest (within a quarter of its range of the
+// middle; a trigger's rest is 0). A device that reports an axis held from the start (a virtual pad nobody holds, a
+// trigger or pedal mapped onto a stick, a stick that rests far off its middle) would otherwise turn the camera on its
+// own, and, counted as pressed, take the gamepad role from the controller in the player's hands for good (pad_follow).
+// A stick the player holds at the start counts once it has been let go.
+enum { AXIS_REST = 8192 };
+static int16_t pad_axis(SDL_Gamepad *p, SDL_GamepadAxis a) {
+    int16_t v = SDL_GetGamepadAxis(p, a);
+    for (int i = 0; i < npads; i++) {
+        if (pads[i] != p) continue;
+        if (pad_rest[i] >> a & 1) return v;
+        if (abs(v) >= AXIS_REST) return 0;
+        pad_rest[i] |= (uint8_t)(1u << a);
+        return v;
+    }
+    return v;
+}
+
+static void stick(SDL_GamepadAxis ax, SDL_GamepadAxis ay, float dead, int32_t out[2]) {
+    input_pad_stick(pad_axis(pad, ax), -(int32_t)pad_axis(pad, ay), dead, out);
+}
+
+// Under lock: 1 when p has a button down, a trigger pulled or a stick past half way (a drifting stick does not count,
+// nor an axis not yet seen at rest).
 static int pad_active(SDL_Gamepad *p) {
     for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++)
         if (SDL_GetGamepadButton(p, (SDL_GamepadButton)b)) return 1;
     for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; a++)
-        if (abs(SDL_GetGamepadAxis(p, (SDL_GamepadAxis)a)) > PAD_USED) return 1;
+        if (abs(pad_axis(p, (SDL_GamepadAxis)a)) > PAD_USED) return 1;
     return 0;
 }
 
@@ -723,8 +805,8 @@ static int pad_physical(uint8_t pd[PAD_COUNT]) {
     pad_follow();
     if (!pad || !SDL_GamepadConnected(pad)) return 0;
     for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
-    pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
-    pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
+    pd[PAD_ZL] = pad_axis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
+    pd[PAD_ZR] = pad_axis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
     for (int p = PAD_ZR + 1; p < PAD_COUNT; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);   // false without paddles
     if (!pad_pressed_logged) {   // once per primary: the log then shows that its presses arrive
         for (int p = PAD_SOUTH; p < PAD_COUNT && !pad_pressed_logged; p++)
@@ -868,10 +950,8 @@ int input_pad_stick_percent(double pct[2]) {
     } else
 #endif
     if (sdl_pad) {   // the game's poll keeps the state fresh (sdl_enter)
-        pct[0] = input_stick_percent(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX),
-                                     SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
-        pct[1] = input_stick_percent(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX),
-                                     SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY));
+        pct[0] = input_stick_percent(pad_axis(pad, SDL_GAMEPAD_AXIS_LEFTX), pad_axis(pad, SDL_GAMEPAD_AXIS_LEFTY));
+        pct[1] = input_stick_percent(pad_axis(pad, SDL_GAMEPAD_AXIS_RIGHTX), pad_axis(pad, SDL_GAMEPAD_AXIS_RIGHTY));
         ok = 1;
     }
     if (in) sdl_leave();
@@ -924,8 +1004,12 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
             input_map_stick(down, 1, k);
             if (walk) k[0] = (int32_t)(k[0] * walk_scale), k[1] = (int32_t)(k[1] * walk_scale);
             pick(&sr[0], &sr[1], k[0], k[1]);
-            int selector = b & (1ull << B_L) ? 1 : b & (1ull << B_UP) ? 2 :
-                           b & (1ull << B_LEFT) ? 3 : b & (1ull << B_RIGHT) ? 4 : 0;
+            // The buttons whose selector the right stick picks from. None in Ocarina (1.1.1): its D-pad acts at once
+            // (ocarina, accessory, Navi, boots), and with L or R held the camera input update goes on taking the
+            // mouse; where an update stops taking it, the mouse is the right stick again (mouse_camera).
+            int selector = rt_game_version == 111 ? 0
+                               : b & (1ull << B_L) ? 1 : b & (1ull << B_UP) ? 2 :
+                                 b & (1ull << B_LEFT) ? 3 : b & (1ull << B_RIGHT) ? 4 : 0;
             mouse_camera(k, selector);
             pick(&sr[0], &sr[1], k[0], k[1]);
             int32_t shake = shake_stick(input_map_held(down, B_SHAKE));

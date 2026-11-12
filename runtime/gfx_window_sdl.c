@@ -29,7 +29,7 @@
 
 static SDL_Window *g_win;
 static uint32_t g_ev_base;               // SDL_RegisterEvents: the user events below
-enum { EV_RUN, EV_SETTINGS, EV_CLOSE, EV_COUNT };
+enum { EV_RUN, EV_SETTINGS, EV_CLOSE, EV_TEXT_ON, EV_TEXT_OFF, EV_PASTE, EV_COUNT };
 static PlatEvent g_video_ready;          // manual-reset: SDL video is up (or failed)
 static int g_video_ok;
 static PlatOnce g_thread_once = PLAT_ONCE_INIT;
@@ -121,6 +121,17 @@ void gfx_window_request_close(void) {
     if (g_win) post(EV_CLOSE);
 }
 
+// SDL sends SDL_EVENT_TEXT_INPUT between SDL_StartTextInput and SDL_StopTextInput only (and shows an on-screen keyboard
+// there where the system has one, as Steam's on a handheld); the window thread makes the calls.
+void gfx_window_text_input(int on) {
+    if (g_win) post(on ? EV_TEXT_ON : EV_TEXT_OFF);
+}
+
+// SDL's clipboard belongs to the window thread: the text is read there and handed to the menu.
+void gfx_window_paste(void) {
+    if (g_win) post(EV_PASTE);
+}
+
 // ---- the display's refresh rate
 static void refresh_rate_update(void) {
     const SDL_DisplayMode *m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_win));
@@ -158,13 +169,26 @@ static void handle(const SDL_Event *e) {
         if (g_win) apply_settings();
         return;
     }
+    if (e->type == g_ev_base + EV_TEXT_ON || e->type == g_ev_base + EV_TEXT_OFF) {
+        if (g_win && e->type == g_ev_base + EV_TEXT_ON) SDL_StartTextInput(g_win);
+        else if (g_win) SDL_StopTextInput(g_win);
+        return;
+    }
+    if (e->type == g_ev_base + EV_PASTE) {
+        char text[256];
+        plat_clipboard_get(text, sizeof text);
+        menu_event_paste(text);
+        return;
+    }
     if (e->type == g_ev_base + EV_CLOSE) gfx_window_closed();
     if (!g_win) return;
     input_sdl_event(e);
     menu_sdl_event(e);
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN:
-        if (e->key.scancode == SDL_SCANCODE_F11 && !e->key.repeat) {
+        // not with a modifier held: overlays and capture tools take Ctrl, Shift or Alt+F11 for their own
+        if (e->key.scancode == SDL_SCANCODE_F11 && !e->key.repeat &&
+            !(e->key.mod & (SDL_KMOD_CTRL | SDL_KMOD_SHIFT | SDL_KMOD_ALT | SDL_KMOD_GUI))) {
             set_fullscreen(!is_fullscreen());
             cfg_set("NX2NAVI_FULLSCREEN", is_fullscreen() ? "1" : "0");   // the menu shows it; the next start keeps it
             cfg_save();

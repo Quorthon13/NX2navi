@@ -203,15 +203,53 @@ def states(app):
         app.show('home', 0)
         s['theme'] = was
 
+    def custom_picker():   # the Custom scheme with two picked colours, and its picker on the button colour
+        from . import art
+        was = {k: s.get(k) for k in ('theme', 'custom_background', 'custom_panel', 'custom_buttons')}
+        s.update(theme='custom', custom_background='#3a1d5c', custom_panel='#24324a', custom_buttons='#2f6fb0')
+        app.apply_look()
+        app.open_picker('buttons')
+        s.update(was)
+        art.set_theme(was['theme'], app.custom_colors())   # the next screen's colours; this one is drawn already
+
     def restore_scheme():
         app.apply_look()
+        app.show('home', 0)
+
+    was_game = s.get('game_dir')
+
+    def mods_screen():   # a game folder of made-up mods, removed when the selftest closes
+        import atexit
+        import shutil
+        import tempfile
+        game = Path(tempfile.mkdtemp(prefix='nx2navi-selftest-'))
+        atexit.register(shutil.rmtree, game, True)
+        for name, files in (('HD Textures', 40), ('Better Menus', 12), ('Classic Music', 3)):
+            for k in range(files):
+                f = game / 'mods' / name / 'romfs' / ('UI' if k < 6 else name.split()[0]) / f'file{k}.bin'
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_bytes(b'0')
+        (game / 'mods' / 'Old Plugin' / 'exefs').mkdir(parents=True)
+        (game / 'mods' / 'Old Plugin' / 'exefs' / 'subsdk9').write_bytes(b'0')
+        (game / 'nx2navi.ini').write_text('[mods]\nmods_disabled = Classic Music\n', encoding='utf-8')
+        s['game_dir'] = str(game)
+        app.mods_page, app.mods_message = 0, ''
+        app.show('mods', next(i for i, r in enumerate(app.rows_mods()) if r.label == 'HD Textures'))
+
+    def mod_order():
+        app.show('mod_order', 1)
+
+    def restore_game():
+        s['game_dir'] = was_game
         app.show('home', 0)
 
     return [('1-first-run', first_run), ('2-installing', installing), ('3-home', home),
             ('4-update-ready', update_ready), ('5-updating', updating), ('6-settings', settings),
             ('7-build-failed', failed), ('8-uninstall', uninstall), ('9-import-saves', import_saves),
             ('10-shaders', shaders), ('11-update-staged', update_staged), ('12-export-save', export_save),
-            ('13-customize', customize), ('14-color-scheme', color_scheme), ('15-first-scheme', restore_scheme)]
+            ('13-customize', customize), ('14-color-scheme', color_scheme), ('15-custom-picker', custom_picker),
+            ('16-first-scheme', restore_scheme), ('17-mods', mods_screen), ('18-mod-order', mod_order),
+            ('19-home-again', restore_game)]
 
 
 def run(app, shots):

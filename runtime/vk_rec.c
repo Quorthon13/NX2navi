@@ -49,7 +49,7 @@ enum {
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
     R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb,
-    R_PassMark, R_DrawMesh, R_DrawMeshInd, R_ShadingRate,
+    R_PassMark, R_DrawMesh, R_DrawMeshInd, R_ShadingRate, R_DrawIndirect,
 };
 
 static uint64_t now_ns(void) { return plat_now_ns(); }
@@ -166,10 +166,15 @@ void rec_begin(VkCommandBuffer cb, uint64_t fence) {
         // past it). Keeping objects until their submission completed and ending a part from the recorder
         // (rec_end_cb) fixed the white scene on an RX 6700 XT, but not this: 0.2.8 turned the recorder on for every
         // GPU and the AMD reports came back the same day. NX2NAVI_VK_RECORDER=1 turns it on for an A/B run.
+        // On AMD GPUs without mesh shaders (GCN: RX 400/500, Vega; RDNA 1) it is on with low_end_gpu = 1: every report above is from an
+        // RDNA 2-4 card, and those all have mesh shaders. An RX 580 ran with it and NX2NAVI_REC_CHECK
+        // (no hazards), the replay's part of the game's wait after a frame's first submission 6.9 ms instead of 12.
         const char *set = cfg_get("NX2NAVI_VK_RECORDER");
-        mode = rt_knob("VK_RECORDER", vk_caps.amd ? "0" : "1");
-        if (!mode && vk_caps.amd && !(set && *set))
-            rt_log("vk_rec: no recorder thread on AMD GPUs (NX2NAVI_VK_RECORDER=1 turns it on)");
+        int amd_off = vk_caps.amd && (vk_ctx()->has_mesh_shader || !rt_knob("LOW_END_GPU", "0"));   // on only with low_end_gpu = 1
+        mode = rt_knob("VK_RECORDER", amd_off ? "0" : "1");
+        if (!mode && amd_off && !(set && *set))
+            rt_log("vk_rec: no recorder thread on AMD GPUs (NX2NAVI_VK_RECORDER=1 turns it on; low_end_gpu = 1 does on "
+                   "cards without mesh shaders)");
         if (mode) {
             plat_event_init(&wake_ev, 0, 0);
             rec_prio = plat_thread_priority_get();
@@ -346,6 +351,9 @@ FIXED(DrawIndexed, (VkCommandBuffer cb, uint32_t n, uint32_t i, uint32_t f, int3
       uint32_t n, i, f; int32_t v; uint32_t fi)
 #define PACK_DrawIndexedIndirect *a = (A_DrawIndexedIndirect){b, o, n, s}
 FIXED(DrawIndexedIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s), (cb, b, o, n, s),
+      VkBuffer b; VkDeviceSize o; uint32_t n, s)
+#define PACK_DrawIndirect *a = (A_DrawIndirect){b, o, n, s}
+FIXED(DrawIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s), (cb, b, o, n, s),
       VkBuffer b; VkDeviceSize o; uint32_t n, s)
 #define PACK_EndQuery *a = (A_EndQuery){p, q}
 FIXED(EndQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q), (cb, p, q), VkQueryPool p; uint32_t q)
@@ -705,6 +713,7 @@ static void exec_packet(uint32_t op, void *p) {
     F(Draw, a->n, a->i, a->f, a->fi)
     F(DrawIndexed, a->n, a->i, a->f, a->v, a->fi)
     F(DrawIndexedIndirect, a->b, a->o, a->n, a->s)
+    F(DrawIndirect, a->b, a->o, a->n, a->s)
     F(EndQuery, a->p, a->q)
     F(FillBuffer, a->b, a->o, a->n, a->v)
     F(ResetQueryPool, a->p, a->f, a->n)

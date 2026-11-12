@@ -90,6 +90,8 @@ struct RtThread {
     const uint32_t *whs;       // a WaitSynchronization that blocks: its handles, in the waiter's own memory (holding G)
     int wn;
     uint32_t waker;            // the thread whose signal ended the last wait (0: a host thread or a timeout)
+    uint64_t blk_since;        // when the current blocking wait began, 0 while not blocked (holding G; wait_watch)
+    int blk_told;              // wait_watch logged the current wait
     uint64_t wake_at, grant_at;   // when a wait was signalled and a core granted, until the thread runs again
     uint64_t lw_ns, lw_n, lw_max, lg_ns, lg_n, lg_max, sl_n, sl_req, sl_act;   // those latencies; SleepThread asked/took
     uint64_t sp_n, sp_ho, sp_site;   // spin wait passes and core handoffs, the last loop head (the thread writes them)
@@ -364,12 +366,27 @@ void kern_free_cores_note(void) {
 
 // NX2NAVI_CORES = 1..NCORE: how many virtual cores run threads (default all NCORE). A core at or above the count is
 // folded onto core (c mod count): a thread pinned to core 5 with NX2NAVI_CORES=3 runs on core 2, one thread per core
-// at a time as always (diagnosis of races that more parallel cores expose).
+// at a time as always (diagnosis of races that more parallel cores expose; the Steam Deck profile's four).
 static int core_allowed(const RtThread *t, int c) {
     if (c >= g_active_cores) return 0;
     for (int j = c; j < NCORE; j += g_active_cores)
         if ((t->mask >> j) & 1) return 1;
     return 0;
+}
+
+// The core number a thread sees (GetCurrentProcessorNumber) while it holds virtual core c. With all NCORE cores that
+// is c. With fewer it is one of the thread's own cores that fold onto c, its ideal core first: the game keys per-core
+// data by this number without locks, so a thread pinned to core 5 must go on using core 5's data when it takes
+// turns with core 1's threads on one virtual core. Seeing 1 there, it used core 1's data in turn with core 1's own
+// threads, and the game died in its draw set-up within seconds of the first frame in play (issue #445; with
+// NX2NAVI_CORES=4 on any machine). No two threads that run guest code see the same number: they hold different
+// virtual cores, and the numbers that fold onto different virtual cores differ.
+static int core_seen(const RtThread *t, int c) {
+    if (g_active_cores >= NCORE) return c;
+    if (t->core >= 0 && t->core < NCORE && t->core % g_active_cores == c && ((t->mask >> t->core) & 1)) return t->core;
+    for (int j = c; j < NCORE; j += g_active_cores)
+        if ((t->mask >> j) & 1) return j;
+    return c;
 }
 
 // ---- asynchronous preemption (NX2NAVI_ASYNC_PREEMPT, on unless 0)
@@ -924,9 +941,61 @@ static uint32_t block(RtThread *t, int kind, int64_t ns) {
     core_put(t);
     acct(t, st_of(kind));
     t->nblk++;
+    t->blk_since = kern_now_ns(), t->blk_told = 0;
     uint32_t r = block_inner(t, kind, ns);
+    t->blk_since = 0;
     core_take(t);
     return r;
+}
+
+// ---- long waits (a freeze's first clue)
+// A guest thread that waits NX2NAVI_WAIT_WATCH_S seconds for a lock, or for another thread to end, is logged once per
+// wait with the thread it waits for and what that one is doing: a game that stops with nothing in its log then names
+// the chain. Waits on condition variables, events and addresses are left out: idle worker threads wait on them for
+// good. Off by default (0), as its thread takes the kernel lock every 2 s; 10 is a good value for a hang report.
+#define WAIT_WATCH_LINES 24
+
+static void wait_watch_holder(char *out, size_t cap, const RtThread *h) {
+    if (!h) { snprintf(out, cap, "no such thread"); return; }
+    if (h->exited) { snprintf(out, cap, "thread %#x, which has ended", h->handle); return; }
+    if (!h->blk_since) { snprintf(out, cap, "thread %#x (priority %d), not waiting", h->handle, h->prio); return; }
+    static const char *const kinds[] = {"nothing", "a lock", "a condition variable", "an address", "a handle"};
+    int k = h->wkind >= 0 && h->wkind <= W_SYNC ? h->wkind : 0;
+    snprintf(out, cap, "thread %#x (priority %d), itself waiting %.1f s for %s (%#llx)", h->handle, h->prio,
+             (kern_now_ns() - h->blk_since) / 1e9, kinds[k], (unsigned long long)h->wobj);
+}
+
+static void wait_watch(void *arg) {
+    (void)arg;
+    uint64_t limit = (uint64_t)atoi(cfg_value("NX2NAVI_WAIT_WATCH_S")) * 1000000000ull;
+    if (!limit) return;
+    int lines = 0;
+    while (lines < WAIT_WATCH_LINES) {
+        plat_wait_ns(2000000000ull);
+        lock();
+        uint64_t now = kern_now_ns();
+        for (RtThread *t = g_all; t && lines < WAIT_WATCH_LINES; t = t->all) {
+            if (!t->blk_since || t->blk_told || now - t->blk_since < limit) continue;
+            char who[160];
+            if (t->wkind == W_LOCK) {   // the lock word's owner field is the holder's handle
+                wait_watch_holder(who, sizeof who, h_peek((uint32_t)t->wobj, O_THREAD));
+                rt_log("kernel: thread %#x (priority %d) has waited %.0f s for the lock at %#llx held by %s",
+                       t->handle, t->prio, (now - t->blk_since) / 1e9, (unsigned long long)t->waddr, who);
+            } else if (t->wkind == W_SYNC && t->whs) {
+                const RtThread *end = NULL;
+                for (int i = 0; i < t->wn && !end; i++) end = h_peek(t->whs[i], O_THREAD);
+                if (!end) continue;
+                wait_watch_holder(who, sizeof who, end);
+                rt_log("kernel: thread %#x (priority %d) has waited %.0f s for the end of %s", t->handle, t->prio,
+                       (now - t->blk_since) / 1e9, who);
+            } else {
+                continue;
+            }
+            t->blk_told = 1, lines++;
+        }
+        unlock();
+    }
+    rt_log("kernel: %d long waits logged: no more", lines);
 }
 
 int kern_core_away(void) {
@@ -1467,6 +1536,11 @@ static void guest_main(void *p) {
 }
 
 void kern_run_on_guest_main(void (*fn)(Cpu *c)) {
+    static int watching;
+    if (!watching++) {
+        PlatThread *w = plat_thread_new(wait_watch, NULL, "wait watch");
+        if (w) plat_thread_detach(w);
+    }
     PlatThread *h = plat_thread_new_ex(guest_main, (void *)fn, "guest main", HOST_STACK);
     if (!h) rt_fatal("kernel: cannot start the guest main thread");
     plat_thread_join(h);
@@ -1707,9 +1781,9 @@ static int kern_svc_inner(Cpu *c, uint32_t imm) {
         unlock();
         return 1;
     }
-    case 0x10: {   // GetCurrentProcessorNumber: the virtual core held
+    case 0x10: {   // GetCurrentProcessorNumber: the core seen on the virtual core held (core_seen)
         RtThread *t = cur(imm);
-        x[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core);
+        x[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? core_seen(t, t->cur_core) : t->core);
         return 1;
     }
     case 0x36: {   // SynchronizePreemptionState: the SDK's spin locks call it after clearing TLR+0x100 (disable_count)
@@ -2090,8 +2164,14 @@ void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear) {
     plat_mutex_lock(&g_se_lock);
     int i = 0;
     while (i < g_nse && g_se[i].ev != ev) i++;
-    if (i == g_nse) {
-        if (g_nse == (int)(sizeof g_se / sizeof *g_se)) rt_fatal("kern_bind_system_event: table full");
+    if (i == g_nse && g_nse == (int)(sizeof g_se / sizeof *g_se)) {
+        // Full: entries are never removed, and a long session binds events at new addresses (two per reload of a
+        // save). An entry whose event the guest destroyed (its state byte is 0, or its memory is gone) gives its slot.
+        i = 0;
+        while (i < g_nse && mem_readable(g_se[i].ev + SE_STATE, 1) && se_live(g_se[i].ev)) i++;
+        if (i == g_nse) rt_fatal("kern_bind_system_event: table full (%d live system events)", g_nse);
+        g_se[i].ev = ev;
+    } else if (i == g_nse) {
         g_se[g_nse++].ev = ev;
     }
     g_se[i].wh = wh;
@@ -2292,7 +2372,66 @@ HOST_OVERRIDE(KERN_SYM_GET_CURRENT_FIBER, kern_fiber_current);
 // NX2NAVI_SVC_SLOW_MS (default 0, off): logs each kernel service that blocks longer than that, with the service number.
 // A stalled frame shows up as time in the replay; this says whether the guest was waiting in a service, and which one,
 // instead of leaving it to a sampler to find.
+// NX2NAVI_SVC_WAITS=1 (diagnosis, default 0): the guest main thread's time in each kernel service, per service and the
+// guest call chain that made it (the lr and up to three callers from the guest's frame records), logged every 10 s as
+// milliseconds per second with the chain named (ldr_describe: the SDK's symbols). What the game's main thread waits for
+// between frames: standing in Hyrule Field on an RX 580 it spent about a fifth of its time blocked in one service call.
+#define SW_N 256
+#define SW_DEPTH 4
+static struct { uint64_t key, lr[SW_DEPTH], ns, n; uint32_t imm; } svw[SW_N];
+static uint64_t svw_t0;
+
+static void svc_wait_note(const Cpu *c, uint32_t imm, uint64_t ns) {
+    uint64_t lr[SW_DEPTH] = {c->x[30]}, fp = c->x[29], key = imm * 0x9E3779B97F4A7C15ull ^ c->x[30];
+    for (int d = 1; d < SW_DEPTH && fp && !(fp & 7) && mem_readable(fp, 16); d++) {
+        uint64_t next = *(const volatile uint64_t *)(uintptr_t)fp, ret = *(const volatile uint64_t *)(uintptr_t)(fp + 8);
+        lr[d] = ret, key = (key ^ ret) * 0x100000001B3ull;
+        if (next <= fp) break;
+        fp = next;
+    }
+    if (!key) key = 1;
+    for (uint32_t k = 0; k < 32; k++) {
+        typeof(svw[0]) *e = &svw[(key + k) % SW_N];
+        if (e->key && e->key != key) continue;
+        if (!e->key) e->key = key, e->imm = imm, memcpy(e->lr, lr, sizeof lr);
+        e->ns += ns, e->n++;
+        break;
+    }
+    uint64_t now = kern_now_ns();
+    if (!svw_t0) svw_t0 = now;
+    if (now - svw_t0 < 10000000000ull) return;
+    double secs = (now - svw_t0) / 1e9;
+    svw_t0 = now;
+    for (int top = 0; top < 6; top++) {
+        int best = -1;
+        for (int i = 0; i < SW_N; i++)
+            if (svw[i].key && svw[i].ns && (best < 0 || svw[i].ns > svw[best].ns)) best = i;
+        if (best < 0) break;
+        char d[SW_DEPTH][96];
+        for (int k = 0; k < SW_DEPTH; k++) {
+            if (svw[best].lr[k]) ldr_describe(svw[best].lr[k], d[k], sizeof d[k]);
+            else d[k][0] = 0;
+        }
+        rt_log("kernel: main thread in service %#x: %.1f ms/s over %llu calls (%.2f ms each) from %s < %s < %s < %s",
+               svw[best].imm, svw[best].ns / 1e6 / secs, (unsigned long long)svw[best].n, svw[best].ns / 1e6 / (double)svw[best].n,
+               d[0], d[1], d[2], d[3]);
+        svw[best].ns = 0;   // listed: out of this round
+    }
+    memset(svw, 0, sizeof svw);
+}
+
 int kern_svc(Cpu *c, uint32_t imm) {
+    static int waits = -1;
+    if (waits < 0) {   // no settings row: cfg_bool only on a set value (an unset key is fatal there)
+        const char *v = cfg_get("NX2NAVI_SVC_WAITS");
+        waits = v && *v && cfg_bool("NX2NAVI_SVC_WAITS");
+    }
+    if (waits && plat_thread_id() == prof_main_tid) {
+        uint64_t w0 = kern_now_ns();
+        int r = kern_svc_inner(c, imm);
+        svc_wait_note(c, imm, kern_now_ns() - w0);
+        return r;
+    }
     static double lim = -1;
     if (lim < 0) lim = strtod(cfg_value("NX2NAVI_SVC_SLOW_MS"), NULL);
     if (lim <= 0) return kern_svc_inner(c, imm);
@@ -2305,4 +2444,24 @@ int kern_svc(Cpu *c, uint32_t imm) {
                tid == prof_replay_tid ? " (the replay thread)" : "");
     }
     return r;
+}
+
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): guest threads, the handle table, the system-event table and fibers, each
+// against its fixed size (the tables are fatal when full).
+void kern_sizes(PerfSizes *s) {
+    uint64_t threads = 0, handles = 0, fibers = 0, ses;
+    plat_mutex_lock_shared(&G);
+    for (RtThread *t = g_all; t; t = t->all) threads++;
+    for (int i = 0; i < MAX_H; i++) handles += g_h[i].type != 0;
+    plat_mutex_unlock_shared(&G);
+    plat_mutex_lock_shared(&g_se_lock);
+    ses = (uint64_t)g_nse;
+    plat_mutex_unlock_shared(&g_se_lock);
+    plat_mutex_lock_shared(&g_fiber_lock);
+    for (int i = 0; i < FIBER_MAX; i++) fibers += g_fibers[i] != NULL;
+    plat_mutex_unlock_shared(&g_fiber_lock);
+    perf_size(s, "guest threads", threads, 0, PERF_SIZE_NONE);
+    perf_size(s, "handles", handles, MAX_H, PERF_SIZE_NONE);
+    perf_size(s, "system events", ses, sizeof g_se / sizeof *g_se, PERF_SIZE_NONE);
+    perf_size(s, "fibers", fibers, FIBER_MAX, PERF_SIZE_NONE);
 }
